@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.km-wrap {
+  padding: 24px;
+}
+
+.km-card {
+  max-width: 720px;
+  border-radius: 18px;
+  border: 1px solid rgba(255,255,255,0.08);
+  background: rgba(0,0,0,0.35);
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.03) inset;
+  overflow: hidden;
+}
+
+.km-title {
+  padding: 18px 18px 10px 18px;
+  font-size: 18px;
+  font-weight: 700;
+  color: rgba(255,255,255,0.92);
+}
+
+.km-list {
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+
+.km-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+
+.km-row:first-child {
+  border-top: none;
+}
+
+.km-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.km-label {
+  font-size: 14px;
+  color: rgba(255,255,255,0.88);
+}
+
+.km-caret {
+  font-size: 10px;
+  opacity: 0.7;
+  transform: translateY(-1px);
+}
+
+.km-right {
+  font-size: 14px;
+  font-weight: 700;
+  color: rgba(255,255,255,0.92);
+}
+
+.km-click { cursor: pointer; }
+
+.km-block { border-top: 1px solid rgba(255,255,255,0.06); }
+.km-block:first-child { border-top: none; }
+
+.km-details {
+  padding: 6px 18px 14px 18px;
+  border-top: 1px dashed rgba(255,255,255,0.10);
+}
+
+.km-detail-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 0;
+}
+
+.km-detail-left {
+  font-size: 13px;
+  color: rgba(255,255,255,0.75);
+}
+
+.km-detail-right {
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(255,255,255,0.92);
+}
+.pr-wrap { margin-top: 16px; }
+.pr-card { border-radius: 16px; border: 1px solid rgba(255,255,255,0.08); background: rgba(0,0,0,0.25); overflow: hidden; }
+.pr-title { padding: 14px 16px; font-weight: 700; }
+.pr-table-wrap { overflow: auto; }
+.pr-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.pr-table th, .pr-table td { padding: 12px 16px; border-top: 1px solid rgba(255,255,255,0.06); white-space: nowrap; }
+.pr-left { text-align: left; }
+.pr-right { text-align: right; }
+.pr-name { font-weight: 600; }
+.pr-cat { opacity: 0.85; }
