@@ -120,3 +120,68 @@ body {
 .pr-right { text-align: right; }
 .pr-name { font-weight: 600; }
 .pr-cat { opacity: 0.85; }
+.tableWrap { overflow: auto; border-radius: 12px; }
+.table { width: 100%; border-collapse: collapse; min-width: 980px; }
+.table thead th {
+  position: sticky; top: 0;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(10px);
+  text-align: left;
+  font-weight: 600;
+  padding: 10px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+.table tbody td {
+  padding: 10px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.table tbody tr:hover { background: rgba(255,255,255,0.04); }
+.num { text-align: right; }
+
+.namecell { display: flex; align-items: center; gap: 10px; }
+.logo { width: 20px; height: 20px; border-radius: 6px; }
+.logo.ph { display: inline-block; width: 20px; height: 20px; border-radius: 6px; background: rgba(255,255,255,0.08); }
+
+.muted { opacity: 0.7; }
+.pos { color: #38d996; }
+.neg { color: #ff5a6a; }
+.nameblock { display: flex; flex-direction: column; gap: 2px; }
+.mainname { line-height: 1.2; }
+.subparts { font-size: 12px; opacity: 0.8; }
+.tip { position: relative; display: inline-block; }
+.tipbox {
+  display: none;
+  position: absolute;
+  right: 0;
+  top: 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(0,0,0,0.9);
+  border: 1px solid rgba(255,255,255,0.08);
+  min-width: 180px;
+  z-index: 50;
+  white-space: nowrap;
+}
+.tip:hover .tipbox { display: block; }
+.namecellInner { display: flex; align-items: center; gap: 10px; }
+.expbtn { width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 0; color: inherit; cursor: pointer; opacity: 0.8; }
+.expbtn.open { transform: rotate(180deg); }
+.expbtn.ph { opacity: 0; }
+.namecell.child { opacity: 0.9; }
+th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+th.sortable:hover {
+  opacity: 0.8;
+}
+.thbtn {
+background: transparent;
+border: 0;
+padding: 0;
+font: inherit;
+color: inherit;
+cursor: pointer;
+}

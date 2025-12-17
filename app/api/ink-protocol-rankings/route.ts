@@ -2,14 +2,74 @@ import { NextResponse } from 'next/server'
 
 export const dynamic = 'force-dynamic'
 
+
 const CHAIN = 'Ink'
 const CHAIN_SLUG = 'ink'
-const norm = (s: any) => String(s ?? '').trim().toLowerCase()
 
 const toNum = (v: any) => {
   const n = Number(v)
   return Number.isFinite(n) ? n : null
 }
+
+
+const norm = (s: any) => String(s ?? '').trim().toLowerCase()
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>) {
+  const out: R[] = new Array(items.length)
+  let i = 0
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const idx = i++
+      if (idx >= items.length) return
+      out[idx] = await fn(items[idx])
+    }
+  })
+
+  await Promise.all(workers)
+  return out
+}
+
+
+async function fetchJson(url: string) {
+  const res = await fetch(url, { cache: 'no-store' })
+  if (!res.ok) throw new Error(`fetch failed ${res.status} ${url}`)
+  return res.json()
+}
+
+async function fetchJsonSoft(url: string) {
+  try {
+    return await fetchJson(url)
+  } catch {
+    return null
+  }
+}
+
+function pickChainTvl(p: any) {
+  const tvls = p?.chainTvls
+  if (!tvls || typeof tvls !== 'object') return null
+
+  const chainObj = tvls?.[CHAIN] ?? tvls?.[CHAIN_SLUG] ?? tvls?.[CHAIN.toLowerCase()] ?? tvls?.[CHAIN_SLUG.toLowerCase()] ?? null
+
+  // chainObj can be a number OR an object with .tvl
+  const n = toNum(chainObj?.tvl ?? chainObj)
+  return n
+}
+
+function hasInkKey(p: any) {
+  const tvls = p?.chainTvls
+  if (!tvls || typeof tvls !== 'object') return false
+  return Object.prototype.hasOwnProperty.call(tvls, CHAIN) || Object.prototype.hasOwnProperty.call(tvls, CHAIN_SLUG)
+}
+
+function pickChangePct(p: any, key: '1d' | '7d' | '1m') {
+  const raw = toNum(p?.change?.[key])
+  if (raw === null) return null
+  if (raw === 0) return null
+  return raw * 100
+}
+
+
 
 const pct = (now: number | null, prev: number | null) => {
   if (now === null || prev === null || prev === 0) return null
@@ -24,485 +84,704 @@ const pctSafe = (now: number | null, prev: number | null) => {
   return p
 }
 
-const pickKeyCI = (obj: any, want: string) => {
-  if (!obj || typeof obj !== 'object') return null
-  const w = norm(want)
-  const k = Object.keys(obj).find((x) => norm(x) === w)
-  return k ? obj[k] : null
-}
+const tvlPointVal = (x: any) =>
+  toNum(x?.totalLiquidityUSD ?? x?.tvl ?? x?.totalLiquidity ?? x?.value ?? x?.usd)
 
-
-const tvlPointVal = (p: any) =>
-  toNum(p?.totalLiquidityUSD ?? p?.tvl ?? p?.totalLiquidity ?? p?.value ?? p?.usd) 
-
-const tvlSeriesFromChain = (
-  detail: any,
-  chainName: string,
-  chainSlug: string
-): { date: number; v: number }[] => {
+function tvlSeriesFromDetail(detail: any) {
   const chainTvls = detail?.chainTvls
-  const chainObj = pickKeyCI(chainTvls, chainName) ?? pickKeyCI(chainTvls, chainSlug) ?? null
-
+  const chainObj = chainTvls?.[CHAIN] ?? chainTvls?.[CHAIN_SLUG] ?? null
   const arr = chainObj?.tvl
   if (!Array.isArray(arr)) return []
 
   return arr
-    .map((x: any) => {
-      const date = toNum(x?.date)
-      const v = tvlPointVal(x)
+    .map((pt: any) => {
+      const date = toNum(pt?.date)
+      const v = tvlPointVal(pt)
       return { date, v }
     })
-    .filter((x: any): x is { date: number; v: number } => x.date !== null && x.v !== null)
+    .filter((pt: any) => pt.date !== null && pt.v !== null) as { date: number; v: number }[]
 }
 
-
-const tvlAtDaysAgo = (series: { date: number; v: number }[], daysAgo: number) => {
+function tvlAtDaysAgo(series: { date: number; v: number }[], daysAgo: number) {
   if (!series.length) return null
   const last = series[series.length - 1]
   const target = last.date - daysAgo * 86400
-
   for (let i = series.length - 1; i >= 0; i--) {
     if (series[i].date <= target) return series[i].v
   }
   return null
 }
 
+async function fetchTvlChangesFallback(slug: string) {
+  const detail = await fetchJsonSoft(`https://api.llama.fi/protocol/${encodeURIComponent(slug)}`)
+  if (!detail) return { c1: null, c7: null, c30: null }
 
-async function fetchJson(url: string) {
+  const s = tvlSeriesFromDetail(detail)
+  const now = s.length ? s[s.length - 1].v : null
+
+  const d1 = tvlAtDaysAgo(s, 1)
+  const d7 = tvlAtDaysAgo(s, 7)
+  const d30 = tvlAtDaysAgo(s, 30)
+
+  return {
+    c1: pctSafe(now, d1),
+    c7: pctSafe(now, d7),
+    c30: pctSafe(now, d30),
+  }
+}
+
+
+const pickAnyNum = (obj: any, keys: string[]) => {
+  for (const k of keys) {
+    const n = toNum(obj?.[k])
+    if (n !== null) return n
+  }
+  return null
+}
+
+const changeFromPrev = (cur: any, prev: any) => {
+  const c = toNum(cur)
+  const p = toNum(prev)
+  if (c === null || p === null || p <= 0) return null
+  return ((c - p) / p) * 100
+}
+
+const prevFromChangePct = (cur: any, pct: any) => {
+  const c = toNum(cur)
+  const p = toNum(pct)
+  if (c === null || p === null) return null
+  const denom = 1 + p / 100
+  if (denom <= 0) return null
+  return c / denom
+}
+
+async function fetchJsonSoftNoThrow(url: string) {
   try {
-    const res = await fetch(url, { cache: 'no-store' })
-    const text = await res.text()
-
-    let json: any = null
-    try {
-      json = JSON.parse(text)
-    } catch {}
-
-    return { ok: res.ok, status: res.status, url, json, text }
-  } catch (e: any) {
-    return { ok: false, status: 0, url, json: null, text: null, error: e?.message || String(e) }
+const res = await fetch(url, { next: { revalidate: 600 } })
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
   }
 }
 
+function sumLastNDaysFromChart(chart: any[], days: number) {
+  if (!Array.isArray(chart) || chart.length === 0) return null
 
+  const nowSec = Math.floor(Date.now() / 1000)
+  const daySec = 86400
 
-function getAny(obj: any, keys: string[]) {
-  for (const k of keys) {
-    const v = obj?.[k]
-    if (v !== undefined && v !== null) return v
+  const startSec = nowSec - days * daySec
+
+  let total = 0
+  let found = 0
+
+  for (const pt of chart) {
+    const ts = toNum(pt?.[0])
+    const val = toNum(pt?.[1])
+    if (ts === null || val === null) continue
+    if (ts < startSec) continue
+    total += val
+    found++
   }
+
+  if (found === 0) return null
+  return total
+}
+
+async function spot7dAndPrev7dFromSummaryDexSlug(dexSlug: string) {
+  const raw = String(dexSlug ?? '').trim()
+  if (!raw) return null
+
+  const cleanBase = (s: string) =>
+    s
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '-')
+      .replace(/-v[0-9]+$/g, '') // velodrome-v3 -> velodrome
+      .replace(/-v[0-9]+-/g, '-') // just in case
+
+  const candidates = Array.from(
+    new Set([
+      raw,
+      raw.toLowerCase(),
+      cleanBase(raw),
+    ].filter(Boolean))
+  )
+
+  for (const cand of candidates) {
+    const j = await fetchJsonSoftNoThrow(
+      `https://api.llama.fi/summary/dexs/${encodeURIComponent(cand)}`
+    )
+    if (!j) continue
+
+    const breakdown = j?.totalDataChartBreakdown ?? null
+    const chart = breakdown?.[CHAIN] ?? breakdown?.[CHAIN_SLUG] ?? null
+    if (!Array.isArray(chart) || chart.length < 14) continue
+
+    const last14 = chart.slice(-14)
+    const vals = last14
+      .map((pt: any) => toNum(pt?.[1]))
+      .filter((x: any) => x !== null) as number[]
+
+    if (vals.length < 14) continue
+
+    const prev7 = vals.slice(0, 7).reduce((a, b) => a + b, 0)
+    const cur7 = vals.slice(7, 14).reduce((a, b) => a + b, 0)
+
+    if (prev7 <= 0) continue
+    return { cur7, prev7 }
+  }
+
   return null
 }
 
-function pickBreakdown(obj: any, keys: string[]) {
-  for (const k of keys) {
-    const v = obj?.[k]
-    if (v && typeof v === 'object') return v
-  }
-  return null
+
+
+const pctMaybe = (v: any) => {
+  const n = toNum(v)
+  if (n === null) return null
+  if (Math.abs(n) <= 5) return n * 100
+  return n
 }
 
-function pickChainSeries(breakdown: any, chain: string, chainSlug: string) {
-  if (!breakdown || typeof breakdown !== 'object') return null
-
-  const direct =
-    breakdown?.[chain] ??
-    breakdown?.[chainSlug] ??
-    breakdown?.[String(chain).toLowerCase()] ??
-    breakdown?.[String(chainSlug).toLowerCase()] ??
-    null
-
-  if (direct) return direct
-
-  // fallback: case-insensitive key match
-  const keys = Object.keys(breakdown)
-  const hit = keys.find((k) => String(k).toLowerCase() === String(chain).toLowerCase())
-  if (hit) return breakdown[hit]
-
-  const hit2 = keys.find((k) => String(k).toLowerCase() === String(chainSlug).toLowerCase())
-  if (hit2) return breakdown[hit2]
-
-  return null
-}
-
-function seriesToVals(series: any): number[] {
-  if (!Array.isArray(series)) return []
-  const out: number[] = []
-
-  for (const row of series) {
-    // can be [ts, value] or { date, value } or { timestamp, total } etc
-    if (Array.isArray(row)) {
-      const v = toNum(row[row.length - 1])
-      if (v !== null) out.push(v)
-      continue
-    }
-    const v =
-      toNum(row?.value) ??
-      toNum(row?.total) ??
-      toNum(row?.tvl) ??
-      toNum(row?.fees) ??
-      toNum(row?.revenue) ??
-      toNum(row?.volume) ??
-      toNum(row?.[1]) ??
-      null
-
-    if (v !== null) out.push(v)
-  }
-
-  return out
-}
-
-function sumLast(vals: number[], n: number) {
-  if (!vals.length) return null
-  const start = Math.max(0, vals.length - n)
-  let s = 0
-  for (let i = start; i < vals.length; i++) s += vals[i]
-  return s
-}
-
-function lastVal(vals: number[]) {
-  if (!vals.length) return null
-  return vals[vals.length - 1]
-}
-
-function weeklyChangeFromDaily(vals: number[]) {
-  // compare last 7 days sum vs previous 7 days sum
-  if (vals.length < 14) return null
-  const last7 = vals.slice(vals.length - 7)
-  const prev7 = vals.slice(vals.length - 14, vals.length - 7)
-  const a = last7.reduce((x, y) => x + y, 0)
-  const b = prev7.reduce((x, y) => x + y, 0)
-  return pct(a, b)
-}
+export const runtime = 'nodejs'
 
 export async function GET(req: Request) {
-  const protocolsUrl = 'https://api.llama.fi/protocols'
+    try {
+const protocols = await fetchJson('https://api.llama.fi/protocols')
 
-  const u = new URL(req.url)
-const debugSlug = u.searchParams.get('debug')
+const [fees, revenue, dexs, dexAggs, bridgeAggs] = await Promise.all([
+  fetchJsonSoft(`https://api.llama.fi/overview/fees/${CHAIN}`),
+  fetchJsonSoft(`https://api.llama.fi/overview/revenue/${CHAIN}`),
+  fetchJsonSoft(`https://api.llama.fi/overview/dexs/${CHAIN}`),
+  fetchJsonSoft(`https://api.llama.fi/overview/dex-aggregators/${CHAIN}`),
+fetchJsonSoft(`https://api.llama.fi/overview/bridge-aggregators/${CHAIN}`),
 
-if (debugSlug) {
-const feesUrl = `https://api.llama.fi/summary/fees/${encodeURIComponent(debugSlug)}`
-
-const revenueUrls = [
-  `https://api.llama.fi/summary/revenue/${encodeURIComponent(debugSlug)}`,
-  `https://api.llama.fi/summary/fees/${encodeURIComponent(debugSlug)}?dataType=revenue`,
-  `https://api.llama.fi/summary/fees/${encodeURIComponent(debugSlug)}?dataType=protocolRevenue`,
-  `https://api.llama.fi/summary/fees/${encodeURIComponent(debugSlug)}?dataType=ProtocolRevenue`,
-]
-
-const feesRes = await fetchJson(feesUrl)
-const revenueResList = await Promise.all(revenueUrls.map((u) => fetchJson(u)))
-
-return NextResponse.json({
-  ok: true,
-  debug: debugSlug,
-
-  fees: {
-    url: feesRes.url,
-    ok: feesRes.ok,
-    status: feesRes.status,
-    text: feesRes.text,
-    json: feesRes.json,
-  },
-
-  revenue: revenueResList.map((r) => ({
-    url: r.url,
-    ok: r.ok,
-    status: r.status,
-    text: r.text,
-    json: r.json,
-  })),
-})
-}
-
-try {
-    const res = await fetchJson(protocolsUrl)
-    if (!res.ok || !Array.isArray(res.json)) {
-      return NextResponse.json(
-        { ok: false, chain: CHAIN, error: { url: protocolsUrl, status: res.status } },
-        { status: 500 }
-      )
-    }
-
-    const all: any[] = res.json
-
-    // ink protocols only, top 25 by ink tvl
-const hasInk = (p: any) => {
-  const chains = Array.isArray(p?.chains) ? p.chains : []
-  const hasChain =
-    chains.some((c: any) => String(c).toLowerCase() === CHAIN_SLUG) ||
-    chains.some((c: any) => String(c).toLowerCase() === CHAIN.toLowerCase())
-
-  const tvls = p?.chainTvls
-  const hasTvlKey =
-    (tvls && typeof tvls === 'object' && (tvls.Ink != null || tvls.ink != null)) ||
-    (tvls &&
-      typeof tvls === 'object' &&
-      Object.keys(tvls).some((k) => String(k).toLowerCase() === CHAIN_SLUG)) ||
-    (tvls &&
-      typeof tvls === 'object' &&
-      Object.keys(tvls).some((k) => String(k).toLowerCase() === CHAIN.toLowerCase()))
-
-  return hasChain || hasTvlKey
-}
-
-const baseRows = all
-  .filter(hasInk)
-  .map((p) => {
-    const ink =
-      p?.chainTvls?.Ink ??
-      p?.chainTvls?.ink ??
-      pickKeyCI(p?.chainTvls, CHAIN) ??
-      pickKeyCI(p?.chainTvls, CHAIN_SLUG) ??
-      null
-
-    const inkTvl = toNum(ink?.tvl) ?? toNum(ink)
-    const inkPrev1d = toNum(ink?.tvlPrevDay)
-    const inkPrev7d = toNum(ink?.tvlPrevWeek)
-    const inkPrev1m = toNum(ink?.tvlPrevMonth)
-
-    const isInkOnly =
-      Array.isArray(p?.chains) &&
-      p.chains.length === 1 &&
-      String(p.chains[0]).toLowerCase() === CHAIN_SLUG
-
-    const tvl = inkTvl ?? (isInkOnly ? toNum(p?.tvl) : null)
-    const prev1d = inkPrev1d ?? (isInkOnly ? toNum(p?.tvlPrevDay) : null)
-    const prev7d = inkPrev7d ?? (isInkOnly ? toNum(p?.tvlPrevWeek) : null)
-    const prev1m = inkPrev1m ?? (isInkOnly ? toNum(p?.tvlPrevMonth) : null)
-
-    return {
-      name: String(p?.name ?? p?.slug ?? ''),
-      slug: String(p?.slug ?? ''),
-      category: String(p?.category ?? ''),
-      tvl,
-      change_1d_pct: pctSafe(tvl, prev1d),
-      change_7d_pct: pctSafe(tvl, prev7d),
-      change_1m_pct: pctSafe(tvl, prev1m),
-      isInkOnly,
-    }
-  })
-  .filter((x) => x.name && x.slug)
-  .sort((a, b) => ((b.tvl ?? 0) as number) - ((a.tvl ?? 0) as number))
-
-
-// const overviewUrl = `https://api.llama.fi/overview/fees/${CHAIN}`
-// const overviewRes = await fetchJson(overviewUrl)
-
-// const overviewMap = new Map<string, any>()
-
-// if (overviewRes.ok && overviewRes.json) {
-//   const list =
-//     overviewRes.json?.protocols ??
-//     overviewRes.json?.data ??
-//     overviewRes.json?.rows ??
-//     overviewRes.json
-
-//   if (Array.isArray(list)) {
-//     for (const p of list) {
-//       const key = String(p?.slug ?? p?.name ?? p?.protocol ?? '').toLowerCase()
-//       if (key) overviewMap.set(key, p)
-//     }
-//   }
-// }
-
- 
-    // enrich with fees/revenue + spot volume
-    const enriched = await Promise.all(
-      baseRows.map(async (r) => {
-        const slug = r.slug
-
-
-        let change_1d_pct = r.change_1d_pct
-let change_7d_pct = r.change_7d_pct
-let change_1m_pct = r.change_1m_pct
-
-if (change_1d_pct === null || change_7d_pct === null || change_1m_pct === null) {
-  const detailRes = await fetchJson(`https://api.llama.fi/protocol/${encodeURIComponent(slug)}`)
-  if (detailRes.ok && detailRes.json) {
-    const s = tvlSeriesFromChain(detailRes.json, CHAIN, CHAIN_SLUG)
-
-    const now = s.length ? s[s.length - 1].v : null
-    const d1 = tvlAtDaysAgo(s, 1)
-    const d7 = tvlAtDaysAgo(s, 7)
-    const d30 = tvlAtDaysAgo(s, 30)
-
-    change_1d_pct = pctSafe(now, d1)
-    change_7d_pct = pctSafe(now, d7)
-    change_1m_pct = pctSafe(now, d30)
-  }
-}
-
-
-        // fees + revenue
-        const feesUrl = `https://api.llama.fi/summary/fees/${encodeURIComponent(slug)}`
-const isDex =
-  String(r.category || '').toLowerCase() === 'dexs' ||
-  String(r.category || '').toLowerCase() === 'dex'
-
-const dexsUrl = isDex
-  ? `https://api.llama.fi/summary/dexs/${encodeURIComponent(slug)}`
-  : null
-
-const [feesRes, dexsRes] = await Promise.all([
-  fetchJson(feesUrl),
-  dexsUrl ? fetchJson(dexsUrl) : Promise.resolve({ ok: false, status: 0, url: '', json: null }),
 ])
 
 
-let fees_24h: number | null = null
-// let revenue_24h: number | null = null
-let fees_7d: number | null = null
-// let revenue_7d: number | null = null
-let fees_30d: number | null = null
-// let revenue_30d: number | null = null
-let fees_1y: number | null = null
-// let revenue_1y: number | null = null
-// let cumulative_revenue: number | null = null
+    const feesBySlug = new Map<string, any>()
+    const revBySlug = new Map<string, any>()
+    const dexBySlug = new Map<string, any>()
 
 
-if (feesRes.ok && feesRes.json) {
-  const j = feesRes.json
 
-  const feesBreakdown = pickBreakdown(j, [
-    'totalDataChartBreakdown',
-    'totalFeesChartBreakdown',
-    'feesChartBreakdown',
-  ])
-
-  const feesSeries = seriesToVals(pickChainSeries(feesBreakdown, CHAIN, CHAIN_SLUG))
-
-  const chainFees24 = lastVal(feesSeries)
-  const chainFees7 = sumLast(feesSeries, 7)
-  const chainFees30 = sumLast(feesSeries, 30)
-  const chainFees1y = sumLast(feesSeries, 365)
-
-  const totalFees24 =
-    toNum(getAny(j, ['total24h', 'fees24h', 'totalFees24h'])) ??
-    toNum(getAny(j, ['total', 'fees'])) ??
-    null
-
-  const totalFees7 = toNum(getAny(j, ['total7d', 'fees7d', 'totalFees7d']))
-  const totalFees30 = toNum(getAny(j, ['total30d', 'fees30d', 'totalFees30d']))
-  const totalFees1y = toNum(getAny(j, ['total1y', 'fees1y', 'totalFees1y']))
-
-  fees_24h = chainFees24 ?? (r.isInkOnly ? totalFees24 : null)
-  fees_7d = chainFees7 ?? (r.isInkOnly ? totalFees7 : null)
-  fees_30d = chainFees30 ?? (r.isInkOnly ? totalFees30 : null)
-  fees_1y = chainFees1y ?? (r.isInkOnly ? totalFees1y : null)
+for (const r of (fees?.protocols ?? [])) {
+  const a = String(r?.slug ?? r?.protocol ?? r?.name ?? '').trim()
+  const b = String(r?.protocol ?? r?.name ?? '').trim()
+  if (a) feesBySlug.set(a, r)
+  if (b) feesBySlug.set(b, r)
 }
 
-
-// const ov = overviewMap.get(String(slug).toLowerCase()) || overviewMap.get(String(r.name).toLowerCase()) || null
-
-// if (ov) {
-//   const rev24 =
-//     toNum(ov?.revenue24h) ??
-//     toNum(ov?.revenue_24h) ??
-//     toNum(ov?.revenue24hUsd) ??
-//     toNum(ov?.total24hRevenue) ??
-//     toNum(ov?.total24hRevenueUsd) ??
-//     null
-
-//   revenue_24h = rev24
-// }
-
-
-// if (revenue_24h === null && feesRes.ok && feesRes.json) {
-//   const maybe =
-//     toNum(feesRes.json?.revenue24h) ??
-//     toNum(feesRes.json?.protocolRevenue24h) ??
-//     toNum(feesRes.json?.total24hRevenue) ??
-//     null
-
-//   if (maybe !== null) revenue_24h = maybe
-// }
-
-
-        let spot_volume_24h: number | null = null
-        let spot_volume_7d: number | null = null
-        let spot_change_7d: number | null = null
-        let spot_cumulative_volume: number | null = null
-
-        if (dexsRes.ok && dexsRes.json) {
-          const j = dexsRes.json
-
-          const volBreakdown = pickBreakdown(j, [
-            'totalDataChartBreakdown',
-            'totalVolumeChartBreakdown',
-            'volumeChartBreakdown',
-          ])
-
-          const volSeries = seriesToVals(pickChainSeries(volBreakdown, CHAIN, CHAIN_SLUG))
-
-          const chainVol24 = lastVal(volSeries)
-          const chainVol7 = sumLast(volSeries, 7)
-          const chainVolAll = volSeries.length ? volSeries.reduce((a, b) => a + b, 0) : null
-          const chainVolChange7 = weeklyChangeFromDaily(volSeries)
-
-          // totals fallback only if ink-only
-          const totalVol24 = toNum(getAny(j, ['total24h', 'totalVolume24h', 'volume24h']))
-          const totalVol7 = toNum(getAny(j, ['total7d', 'totalVolume7d', 'volume7d']))
-          const totalVolAll = toNum(getAny(j, ['totalAllTime', 'cumulativeVolume', 'totalVolumeAllTime']))
-const totalVolChange7 = toNum(getAny(j, ['change_7d', 'weeklyChange', 'weekly_change_pct']))
-
-spot_change_7d = chainVolChange7 ?? null
-// only use total change if ink-only and it is not 0 (0 is usually a missing placeholder)
-if (spot_change_7d === null && r.isInkOnly && typeof totalVolChange7 === 'number' && totalVolChange7 !== 0) {
-  spot_change_7d = totalVolChange7
+for (const r of (revenue?.protocols ?? [])) {
+  const a = String(r?.slug ?? r?.protocol ?? r?.name ?? '').trim()
+  const b = String(r?.protocol ?? r?.name ?? '').trim()
+  if (a) revBySlug.set(a, r)
+  if (b) revBySlug.set(b, r)
 }
 
-          spot_volume_24h = chainVol24 ?? (r.isInkOnly ? totalVol24 : null)
-          spot_volume_7d = chainVol7 ?? (r.isInkOnly ? totalVol7 : null)
-          spot_cumulative_volume = chainVolAll ?? (r.isInkOnly ? totalVolAll : null)
-        }
-
-return {
-  name: r.name,
-  slug: r.slug,
-  category: r.category,
-  tvl: r.tvl,
-
-  change_1d_pct: change_1d_pct,
-  change_7d_pct: change_7d_pct,
-  change_1m_pct: change_1m_pct,
-
-  fees_24h,
-  // revenue_24h,
-  fees_7d,
-  // revenue_7d,
-  fees_30d,
-  // revenue_30d,
-  fees_1y,
-  // revenue_1y,
-  // cumulative_revenue,
-
-  spot_volume_24h,
-  spot_volume_7d,
-  spot_change_7d,
-  spot_cumulative_volume,
+for (const r of (dexs?.protocols ?? [])) {
+  const a = String(r?.slug ?? r?.protocol ?? r?.name ?? '').trim()
+  const b = String(r?.protocol ?? r?.name ?? '').trim()
+if (a) {
+  dexBySlug.set(a, r)
+  dexBySlug.set(norm(a), r)
 }
-      })
+if (b) {
+  dexBySlug.set(b, r)
+  dexBySlug.set(norm(b), r)
+}
+}
+
+const feesSet = new Set(Array.from(feesBySlug.keys()).map(norm))
+const revSet = new Set(Array.from(revBySlug.keys()).map(norm))
+const dexSet = new Set(Array.from(dexBySlug.keys()).map(norm))
+
+    
+let rows = (protocols ?? [])
+      .map((p: any) => {
+        const slug = String(p?.slug ?? '')
+        const chains = (p?.chains ?? []).map((x: any) => String(x).toLowerCase())
+const tvlInk = pickChainTvl(p)
+
+const slugNorm = norm(slug)
+const nameNorm = norm(p?.name)
+
+const fullName = String(p?.name ?? '').trim().toLowerCase()
+const fullSlug = String(slug ?? '').trim().toLowerCase()
+
+const listedInChains =
+  chains.includes(CHAIN.toLowerCase()) ||
+  chains.includes(CHAIN_SLUG) ||
+  hasInkKey(p)
+
+const listedInOverviews =
+  feesSet.has(slugNorm) ||
+  revSet.has(slugNorm) ||
+  dexSet.has(slugNorm) ||
+  feesSet.has(nameNorm) ||
+  revSet.has(nameNorm) ||
+  dexSet.has(nameNorm) ||
+  feesSet.has(fullName) ||
+  revSet.has(fullName) ||
+  dexSet.has(fullName) ||
+  feesSet.has(fullSlug) ||
+  revSet.has(fullSlug) ||
+  dexSet.has(fullSlug)
+
+
+
+const hasInk = listedInChains || listedInOverviews
+if (!hasInk) return null
+
+
+
+        const f = feesBySlug.get(slug) ?? null
+        const rv = revBySlug.get(slug) ?? null
+const dx =
+  dexBySlug.get(slug) ??
+  dexBySlug.get(norm(slug)) ??
+  dexBySlug.get(p?.name ?? '') ??
+  dexBySlug.get(norm(p?.name)) ??
+  null
+
+        return {
+          name: p?.name ?? slug,
+          parts: [String(p?.name ?? slug)].filter(Boolean),
+          slug,
+          category: p?.category ?? null,
+          logo: p?.logo ?? null,
+
+tvl: tvlInk ?? 0,
+          change_1d_pct: pickChangePct(p, '1d'),
+          change_7d_pct: pickChangePct(p, '7d'),
+          change_1m_pct: pickChangePct(p, '1m'),
+
+          fees_24h: toNum(f?.total24h),
+          fees_7d: toNum(f?.total7d),
+          fees_30d: toNum(f?.total30d),
+          fees_1y: toNum(f?.total1y),
+
+revenue_24h: pickAnyNum(rv, ['revenue24h', 'total24h']),
+revenue_7d: pickAnyNum(rv, ['revenue7d', 'total7d']),
+revenue_30d: pickAnyNum(rv, ['revenue30d', 'total30d']),
+revenue_1y: pickAnyNum(rv, ['revenue1y', 'total1y']),
+
+cumulative_revenue: pickAnyNum(rv, ['totalAllTime', 'total_all_time', 'allTime', 'cumulative', 'cumulativeRevenue']),
+
+          spot_volume_24h: toNum(dx?.total24h),
+spot_volume_7d: toNum(dx?.total7d),
+
+spot_prev_7d: prevFromChangePct(
+  toNum(dx?.total7d),
+pctMaybe(pickAnyNum(dx, ['change_7dover7d', 'change7dover7d', 'change7d', 'change_7d', 'weeklyChange', 'change']))
+),
+
+spot_change_7d:
+  changeFromPrev(
+    toNum(dx?.total7d),
+    prevFromChangePct(
+      toNum(dx?.total7d),
+pctMaybe(pickAnyNum(dx, ['change_7dover7d', 'change7dover7d', 'change7d', 'change_7d', 'weeklyChange', 'change']))
     )
+  ) ??
+pctMaybe(pickAnyNum(dx, ['change_7dover7d', 'change7dover7d', 'change7d', 'change_7d', 'weeklyChange', 'change'])),
 
 
-return NextResponse.json({
-  ok: true,
-  chain: CHAIN,
-  counts: {
-    allProtocols: all.length,
-    baseRows: baseRows.length,
-    enriched: enriched.length,
-  },
-  rows: enriched,
-  source: protocolsUrl,
-  ts: Date.now(),
+dex_sources: dx ? [String(dx?.slug ?? dx?.protocol ?? dx?.name ?? slug)] : [],
+spot_cumulative_volume:
+  pickAnyNum(dx, ['totalAllTime', 'total_all_time', 'allTime', 'cumulative', 'cumulativeVolume']) ??
+  pickAnyNum(dx, ['total1y', 'volume1y']) ??
+  pickAnyNum(dx, ['total30d', 'volume30d']),
+          spot_volume_30d: toNum(dx?.total30d),
+          spot_volume_1y: toNum(dx?.total1y),
+        }
+      })
+      .filter(Boolean)
+      .sort((a: any, b: any) => (b.tvl ?? 0) - (a.tvl ?? 0))
+
+const CHANGES_CONCURRENCY = 6
+
+rows = await mapLimit(rows as any[], CHANGES_CONCURRENCY, async (r: any) => {
+  const tvl = typeof r?.tvl === 'number' ? r.tvl : null
+  if (tvl === null || tvl <= 0) return r
+
+  if (r.change_1d_pct !== null && r.change_7d_pct !== null && r.change_1m_pct !== null) return r
+
+  const { c1, c7, c30 } = await fetchTvlChangesFallback(String(r.slug ?? ''))
+
+  return {
+    ...r,
+    change_1d_pct: r.change_1d_pct ?? c1,
+    change_7d_pct: r.change_7d_pct ?? c7,
+    change_1m_pct: r.change_1m_pct ?? c30,
+  }
 })
 
+      const have = new Set((rows as any[]).map((x: any) => norm(x?.slug ?? x?.name)))
+
+      const logosByKey = new Map<string, string>()
+
+for (const p of (protocols ?? [])) {
+  const slug = String(p?.slug ?? '').trim()
+  const name = String(p?.name ?? '').trim()
+  const logo = String(p?.logo ?? '').trim()
+  if (!logo) continue
+
+  if (slug) logosByKey.set(norm(slug), logo)
+  if (name) logosByKey.set(norm(name), logo)
+}
+
+const pickAny = (obj: any, keys: string[]) => {
+  for (const k of keys) {
+    const n = toNum(obj?.[k])
+    if (n !== null) return n
+  }
+  return null
+}
+
+const addFromList = (list: any, tag: string) => {
+  for (const r of (list?.protocols ?? [])) {
+    const name = String(r?.name ?? r?.protocol ?? r?.slug ?? '').trim()
+    const slug = String(r?.slug ?? r?.protocol ?? '').trim()
+    const key = norm(slug || name)
+    if (!key || have.has(key)) continue
+
+    rows.push({
+      name: name || slug || tag,
+      parts: [String(name || slug || '')].filter(Boolean),
+      slug: slug || key,
+      category: tag,
+logo:
+  logosByKey.get(norm(slug || name)) ??
+  logosByKey.get(norm(name)) ??
+  logosByKey.get(norm(slug)) ??
+  (slug ? `https://icons.llama.fi/${encodeURIComponent(slug)}.png` : null),
+
+      tvl: 0,
+      change_1d_pct: null,
+      change_7d_pct: null,
+      change_1m_pct: null,
+
+      fees_24h: null,
+      fees_7d: null,
+      fees_30d: null,
+      fees_1y: null,
+
+      revenue_24h: null,
+      revenue_7d: null,
+      revenue_30d: null,
+      revenue_1y: null,
+      cumulative_revenue: null,
+
+dex_sources: [String(slug || name || '')].filter(Boolean),
+
+      spot_volume_24h: pickAny(r, ['total24h', 'volume24h']),
+spot_volume_7d: pickAny(r, ['total7d', 'volume7d']),
+
+spot_prev_7d: prevFromChangePct(
+  pickAny(r, ['total7d', 'volume7d']),
+  pctMaybe(pickAny(r, ['change_7dover7d', 'change7dover7d', 'change7d', 'change_7d', 'change_7d_pct', 'change7dPct', 'weeklyChange', 'change']
+
+))
+),
+
+spot_change_7d: changeFromPrev(
+  pickAny(r, ['total7d', 'volume7d']),
+  prevFromChangePct(
+    pickAny(r, ['total7d', 'volume7d']),
+    pctMaybe(pickAny(r, ['change_7dover7d', 'change7dover7d', 'change7d', 'change_7d', 'change_7d_pct', 'change7dPct', 'weeklyChange', 'change']
+
+))
+  )
+),
+
+spot_cumulative_volume:
+  pickAny(r, ['totalAllTime', 'total_all_time', 'allTime', 'cumulative', 'cumulativeVolume']) ??
+  pickAny(r, ['total1y', 'volume1y']) ??
+  pickAny(r, ['total30d', 'volume30d']),
+
+      spot_volume_30d: pickAny(r, ['total30d', 'volume30d']),
+      spot_volume_1y: pickAny(r, ['total1y', 'volume1y']),
+    })
+
+    have.add(key)
+  }
+}
+
+addFromList(dexAggs, 'Dex Aggregator')
+addFromList(bridgeAggs, 'Bridge Aggregator')
+
+const baseKey = (name: any, slug: any) => {
+  const raw = String(name ?? '').trim()
+  const n = raw.toLowerCase()
+  const s = String(slug ?? '').trim().toLowerCase()
+
+  const clean = (x: string) => {
+    let t = x.trim()
+
+    // remove common endings
+const endings = [
+  ' perps',
+  ' perp',
+  ' spot',
+  ' swap',
+  ' lending',
+  ' borrow',
+  ' vault',
+  ' pools',
+  ' pool',
+  ' bridge',
+  ' exchange',
+  ' clmm',
+  ' amm',
+  ' v1',
+  ' v2',
+  ' v3',
+  ' v4',
+]
+
+    for (const e of endings) {
+      if (t.endsWith(e)) t = t.slice(0, -e.length).trim()
+    }
+
+    // remove double spaces
+    t = t.replace(/\s+/g, ' ').trim()
+
+    return t
+  }
+
+  // prefer name clean
+  const a = clean(n)
+  if (a) return a
+
+  // fallback slug clean
+  const b = clean(s.replace(/[-_]/g, ' '))
+  if (b) return b
+
+  return (n || s).toLowerCase()
+}
+
+
+const shortName = (k: string) => {
+  const t = String(k ?? '').trim().toLowerCase()
+
+  // special shorten rules like DefiLlama
+  if (t.includes('securitize')) return 'Securitize'
+
+  // fallback title case
+  return t
+    .split(/[\s-]+/)
+    .filter(Boolean)
+    .map(w => w.slice(0, 1).toUpperCase() + w.slice(1))
+    .join(' ')
+}
+
+
+const sum = (a: any, b: any) => {
+  const x = toNum(a)
+  const y = toNum(b)
+  if (x === null && y === null) return null
+  return (x ?? 0) + (y ?? 0)
+}
+
+const mergePct = (p1: any, w1: any, p2: any, w2: any) => {
+  const a = toNum(p1)
+  const b = toNum(p2)
+  const wa = toNum(w1) ?? 0
+  const wb = toNum(w2) ?? 0
+  if (a === null && b === null) return null
+  if (a !== null && b === null) return a
+  if (a === null && b !== null) return b
+  const denom = wa + wb
+  if (denom <= 0) return a
+  return ((a as number) * wa + (b as number) * wb) / denom
+}
+
+const mergeSpotChange7d = (curA: any, pctA: any, curB: any, pctB: any) => {
+  const a = toNum(curA) ?? 0
+  const b = toNum(curB) ?? 0
+  const pa = toNum(pctA)
+  const pb = toNum(pctB)
+
+  // if we do not have both changes, keep the one we have
+  if (pa === null && pb === null) return null
+  if (pa !== null && pb === null) return pa
+  if (pa === null && pb !== null) return pb
+
+  const prevA = pa === -100 ? 0 : a / (1 + (pa as number) / 100)
+  const prevB = pb === -100 ? 0 : b / (1 + (pb as number) / 100)
+
+  const prev = prevA + prevB
+  const cur = a + b
+
+  if (prev <= 0) return null
+  return ((cur - prev) / prev) * 100
+}
+
+const merged: any[] = []
+const idx = new Map<string, number>()
+
+for (const r of rows as any[]) {
+  const k = baseKey(r?.name, r?.slug)
+  const i = idx.get(k)
+
+  if (i === undefined) {
+    idx.set(k, merged.length)
+merged.push({
+  ...r,
+  name: shortName(k),
+  slug: k,
+  parts: Array.from(new Set([...(r.parts ?? [r.name])].filter(Boolean))),
+  children: [r],
+})
+
+
+    continue
+  }
+
+  const cur = merged[i]
+
+cur.children = Array.isArray(cur.children) ? cur.children : []
+cur.children.push(r)
+
+cur.parts = Array.from(new Set([...(cur.parts ?? [cur.name]), ...(r.parts ?? [r.name])].filter(Boolean)))
+
+  const tvlA = toNum(cur?.tvl) ?? 0
+  const tvlB = toNum(r?.tvl) ?? 0
+
+  cur.tvl = tvlA + tvlB
+
+  cur.fees_24h = sum(cur.fees_24h, r.fees_24h)
+  cur.fees_7d = sum(cur.fees_7d, r.fees_7d)
+  cur.fees_30d = sum(cur.fees_30d, r.fees_30d)
+  cur.fees_1y = sum(cur.fees_1y, r.fees_1y)
+
+  cur.revenue_24h = sum(cur.revenue_24h, r.revenue_24h)
+  cur.revenue_7d = sum(cur.revenue_7d, r.revenue_7d)
+  cur.revenue_30d = sum(cur.revenue_30d, r.revenue_30d)
+  cur.revenue_1y = sum(cur.revenue_1y, r.revenue_1y)
+
+  cur.spot_volume_24h = sum(cur.spot_volume_24h, r.spot_volume_24h)
+  cur.spot_volume_7d = sum(cur.spot_volume_7d, r.spot_volume_7d)
+  cur.spot_prev_7d = sum(cur.spot_prev_7d, r.spot_prev_7d)
+cur.spot_change_7d = changeFromPrev(cur.spot_volume_7d, cur.spot_prev_7d)
+  cur.spot_volume_30d = sum(cur.spot_volume_30d, r.spot_volume_30d)
+  cur.spot_volume_1y = sum(cur.spot_volume_1y, r.spot_volume_1y)
+if (cur.spot_cumulative_volume === null) {
+  cur.spot_cumulative_volume = (toNum(cur.spot_volume_1y) ?? null) ?? (toNum(cur.spot_volume_30d) ?? null)
+}
+
+  cur.change_1d_pct = mergePct(cur.change_1d_pct, tvlA, r.change_1d_pct, tvlB)
+  cur.change_7d_pct = mergePct(cur.change_7d_pct, tvlA, r.change_7d_pct, tvlB)
+  cur.change_1m_pct = mergePct(cur.change_1m_pct, tvlA, r.change_1m_pct, tvlB)
+cur.dex_sources = Array.from(new Set([...(cur.dex_sources ?? []), ...(r.dex_sources ?? [])]))
+
+  // keep a real logo if we have one
+  if (!cur.logo && r.logo) cur.logo = r.logo
+
+  // keep category if missing
+  if (!cur.category && r.category) cur.category = r.category
+}
+
+rows = merged.sort((a: any, b: any) => (b.tvl ?? 0) - (a.tvl ?? 0))
+
+for (const row of rows as any[]) {
+const CONCURRENCY = 4
+
+await mapLimit(rows as any[], CONCURRENCY, async (row: any) => {
+const srcs: string[] = row?.dex_sources ?? []
+if (!srcs.length) return
+
+let cur7Sum = 0
+let prev7Sum = 0
+let got = 0
+const partsOut: any[] = []
+
+for (const s of srcs) {
+let cur7: number | null = null
+let prev7: number | null = null
+
+const out = await spot7dAndPrev7dFromSummaryDexSlug(String(s))
+if (out) {
+  cur7 = out.cur7
+  prev7 = out.prev7
+} else {
+  const dx = dexBySlug.get(String(s)) ?? dexBySlug.get(norm(s)) ?? null
+  const c7 = toNum(dx?.total7d)
+  const ch7 = toNum(
+    pickAnyNum(dx, [
+      'change_7dover7d',
+      'change7dover7d',
+      'change7d',
+      'change_7d',
+      'weeklyChange',
+      'change',
+    ])
+  )
+
+  if (c7 !== null && ch7 !== null) {
+    let p7: number | null = null
+    if (ch7 === -100 && c7 === 0) {
+      p7 = toNum(dx?.total14dto7d) ?? toNum(dx?.total7DaysAgo) ?? null
+    } else {
+      p7 = prevFromChangePct(c7, ch7)
+    }
+    if (p7 !== null) {
+      cur7 = c7
+      prev7 = p7
+    }
+  }
+}
+
+if (cur7 === null || prev7 === null || prev7 <= 0) continue
+
+partsOut.push({
+  source: String(s),
+  spot_volume_7d: cur7,
+  spot_prev_7d: prev7,
+  spot_delta_7d: cur7 - prev7,
+})
+
+cur7Sum += cur7
+prev7Sum += prev7
+got++
+
+
+}
+
+if (!got || prev7Sum <= 0) return
+
+row.spot_volume_7d = cur7Sum
+row.spot_prev_7d = prev7Sum
+
+let pctSum = 0
+row.spot_parts = partsOut.map((p: any) => {
+const cur7 = toNum(p?.spot_volume_7d)
+const prev7 = toNum(p?.spot_prev_7d)
+if (cur7 === null || prev7 === null || prev7 <= 0) return { ...p, spot_change_7d: null }
+const pct = ((cur7 - prev7) / prev7) * 100
+pctSum += pct
+return { ...p, spot_change_7d: pct }
+})
+
+row.spot_change_7d = pctSum
+})
+}
+
+
+
+const res = NextResponse.json({ ok: true, chain: CHAIN, count: rows.length, rows })
+res.headers.set('Cache-Control', 'public, max-age=30, s-maxage=30, stale-while-revalidate=300')
+return res
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, chain: CHAIN, error: { msg: e?.message || String(e) } },
+      {
+        ok: false,
+        chain: CHAIN,
+        error: String(e?.message ?? e),
+      },
       { status: 500 }
     )
   }
